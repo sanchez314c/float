@@ -1,0 +1,50 @@
+# Float runtime artifacts
+*.m3u
+*.pid
+*.pids
+
+# Backups
+*.backup.*
+
+# Archive & legacy
+archive/
+legacy/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# OS metadata
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+
+# Build output
+dist/
+build/
+out/
+
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# Logs & temp
+*.log
+*.tmp
+.cache/
+
+# Coverage
+coverage/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

@@ -1,0 +1,569 @@
+#!/bin/bash
+# float — Desktop video blender (requires bash 4+)
+# Plays videos as translucent animated wallpaper with dreamy real-time effects
+# and audio-reactive modulation from system audio output
+#
+# Usage:
+#   float <video_or_folder>                        # Single video, primary monitor
+#   float <video_or_folder> --collage              # Random tiled collage that reshuffles
+#   float <video_or_folder> --shuffle              # Shuffle playlist order
+#   float <video_or_folder> --all                  # Play on all monitors
+#   float <video_or_folder> --opacity 0.04         # Set opacity
+#   float <video_or_folder> --player               # Single movable/resizable window
+#   float <video_or_folder> --player --effects     # Player with dream effects
+#   float --next                                   # Skip to next video (all tiles)
+#   float --prev                                   # Skip to previous video (all tiles)
+#   float --stop                                   # Kill everything
+#   float --list                                   # Show running instances
+
+# Resolve script location for finding bundled assets
+FLOAT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+DREAM_SCRIPT="$FLOAT_DIR/scripts/dream-collage.lua"
+ROUNDED_SHADER="$FLOAT_DIR/scripts/rounded-corners.glsl"
+VIGNETTE_SHADER="$FLOAT_DIR/scripts/vignette.glsl"
+
+readonly PIDFILE="/tmp/float.pids"
+readonly PLAYLIST_BASE="/tmp/float"
+readonly VIDEO_EXTENSIONS="mp4|mkv|avi|webm|mov|flv|wmv|m4v"
+readonly COLLAGE_CONTROLLER_PID="/tmp/float-collage.pid"
+TILE_COUNTER=0
+readonly AUDIO_PULSE_PID="/tmp/float-audio-pulse.pid"
+readonly SETTINGS_FILE="$HOME/.config/float/settings.conf"
+readonly LUT_LIST_FILE="/tmp/float-luts.list"
+readonly LUT_INTERVAL_FILE="/tmp/float-lut-interval"
+
+stop_all() {
+    # Kill collage controller
+    if [ -f "$COLLAGE_CONTROLLER_PID" ]; then
+        kill $(cat "$COLLAGE_CONTROLLER_PID") 2>/dev/null
+        kill -9 $(cat "$COLLAGE_CONTROLLER_PID") 2>/dev/null
+        rm -f "$COLLAGE_CONTROLLER_PID"
+    fi
+    # Kill tracked PIDs
+    if [ -f "$PIDFILE" ]; then
+        while read pid; do
+            kill "$pid" 2>/dev/null
+            kill -9 "$pid" 2>/dev/null
+        done < "$PIDFILE"
+        rm -f "$PIDFILE"
+    fi
+    # Nuke everything by pattern
+    pkill -9 -f "xwinwrap.*mpv" 2>/dev/null
+    pkill -9 -f "x11-name=floatvid" 2>/dev/null
+    pkill -9 -f "title=float-player" 2>/dev/null
+    pkill -9 -f "float-drift.sh" 2>/dev/null
+    pkill -9 -f "run_collage_loop" 2>/dev/null
+    pkill -9 -f "float-collage" 2>/dev/null
+    pkill -9 -f "sleep.*float" 2>/dev/null
+    # Kill picom if we started it
+    if [ -f "/tmp/float-picom.pid" ]; then
+        kill $(cat /tmp/float-picom.pid) 2>/dev/null
+        rm -f /tmp/float-picom.pid
+    fi
+    rm -f /tmp/mpv-float-*.sock /tmp/float-collage-pids
+    # Kill audio pulse daemon
+    if [ -f "$AUDIO_PULSE_PID" ]; then
+        kill $(cat "$AUDIO_PULSE_PID") 2>/dev/null
+        kill -9 $(cat "$AUDIO_PULSE_PID") 2>/dev/null
+        rm -f "$AUDIO_PULSE_PID"
+    fi
+    pkill -9 -f "audio-pulse.py" 2>/dev/null
+    rm -f /tmp/float-audio /tmp/float-audio.tmp
+    rm -f /tmp/float-luts.list /tmp/float-lut-interval
+    rm -f ${PLAYLIST_BASE}*.m3u
+    echo "float stopped."
+}
+
+list_running() {
+    local count=$(pgrep -cf "xwinwrap.*mpv" 2>/dev/null)
+    if [ "$count" -gt 0 ]; then
+        echo "$count video tiles running."
+        pgrep -fa "xwinwrap.*mpv" 2>/dev/null
+    else
+        echo "No float instances running."
+    fi
+}
+
+get_monitor_geometry() {
+    local mon_num="${1:-1}"
+    local idx=0
+    while read line; do
+        idx=$((idx + 1))
+        if [ "$idx" -eq "$mon_num" ]; then
+            echo "$line" | grep -oE '[0-9]+x[0-9]+\+[0-9]+\+[0-9]+'
+            return
+        fi
+    done < <(xrandr --current | grep ' connected' | sort -t'+' -k2 -n)
+}
+
+find_videos() {
+    local source="$1"
+    find "$source" -type f -regextype posix-extended \
+        -iregex ".*\.(${VIDEO_EXTENSIONS})" 2>/dev/null
+}
+
+build_playlist() {
+    local source="$1"
+    local shuffle="$2"
+    local outfile="$3"
+
+    rm -f "$outfile"
+
+    if [ -d "$source" ]; then
+        if [ "$shuffle" = "yes" ]; then
+            find_videos "$source" | shuf > "$outfile"
+        else
+            find_videos "$source" | sort > "$outfile"
+        fi
+        local count=$(wc -l < "$outfile")
+        if [ "$count" -eq 0 ]; then
+            echo "No video files found in: $source"
+            rm -f "$outfile"
+            return 1
+        fi
+        return 0
+    else
+        echo "$source" > "$outfile"
+        return 0
+    fi
+}
+
+play_on_geometry() {
+    local playlist="$1"
+    local geom="$2"
+    local shuffle="$3"
+    local opacity="$4"
+    local start_idx="${5:-0}"
+    local vf_extra="${6:-}"
+
+    TILE_COUNTER=$((TILE_COUNTER + 1))
+    local sock="/tmp/mpv-float-${TILE_COUNTER}.sock"
+
+    local vf_flag=""
+    if [ -n "$vf_extra" ]; then
+        vf_flag="--vf=$vf_extra"
+    fi
+
+    # xwinwrap flags: -fdt=fullscreen-desktop-type, -ni=no-input, -b=below, -nf=no-focus, -un=unredirect
+    # -argb enables per-pixel alpha so the shader's edge fade actually works
+    # -o sets the base uniform opacity, -argb lets the shader dissolve edges to nothing
+    xwinwrap -g "${geom}" -fdt -ni -b -nf -un -argb -o ${opacity} -- \
+        bash -c "mpv --wid=\$1 \
+            --no-audio \
+            --loop-playlist \
+            --no-osc \
+            --no-osd-bar \
+            --no-input-default-bindings \
+            --input-ipc-server=\"$sock\" \
+            --playlist-start=$start_idx \
+            --alpha=yes \
+            --panscan=0.5 \
+            --hwdec=auto \
+            --script=\"$DREAM_SCRIPT\" \
+            --glsl-shader=\"$ROUNDED_SHADER\" \
+            --really-quiet \
+            $vf_flag \
+            --playlist=\"$playlist\"" _ WID &
+
+    echo $! >> "$PIDFILE"
+}
+
+# === COLLAGE MODE ===
+# Uses xwinwrap for opacity + click-through + below-desktop (proven to work)
+# Each tile is a random size/position, reshuffles periodically
+# Each mpv instance gets a unique random seed so effects are independent
+
+kill_tiles() {
+    if [ -f "$PIDFILE" ]; then
+        while read pid; do
+            kill -9 "$pid" 2>/dev/null
+        done < "$PIDFILE"
+        rm -f "$PIDFILE"
+    fi
+    pkill -9 -f "xwinwrap.*mpv" 2>/dev/null
+    rm -f ${PLAYLIST_BASE}_tile_*.m3u
+}
+
+spawn_collage() {
+    local input="$1"
+    local opacity="$2"
+    local screen_w="$3"
+    local screen_h="$4"
+    local num_tiles="$5"
+
+    echo "[$(date +%H:%M:%S)] Spawning $num_tiles tiles"
+
+    for i in $(seq 1 "$num_tiles"); do
+        # Random width 25-60% of screen
+        local min_w=$((screen_w / 4))
+        local range_w=$((screen_w * 35 / 100))
+        local w=$((min_w + RANDOM % range_w))
+        # Roughly 16:9 with variance
+        local h=$((w * 9 / 16 + RANDOM % (w / 8) - w / 16))
+        if [ "$h" -lt 200 ]; then h=200; fi
+        if [ "$h" -gt "$((screen_h * 6 / 10))" ]; then h=$((screen_h * 6 / 10)); fi
+
+        # Random position
+        local max_x=$((screen_w - w))
+        local max_y=$((screen_h - h))
+        if [ "$max_x" -lt 0 ]; then max_x=0; fi
+        if [ "$max_y" -lt 0 ]; then max_y=0; fi
+        local x=$((RANDOM % (max_x + 1)))
+        local y=$((RANDOM % (max_y + 1)))
+
+        local geom="${w}x${h}+${x}+${y}"
+        local playlist="${PLAYLIST_BASE}_tile_${i}.m3u"
+        build_playlist "$input" "yes" "$playlist" 2>/dev/null
+
+        # Random start offset so no two tiles begin on the same video
+        local pcount=$(wc -l < "$playlist" 2>/dev/null || echo 1)
+        local start_idx=$((RANDOM % pcount))
+
+        # 30% chance to horizontally flip this tile
+        local vf=""
+        if [ $((RANDOM % 100)) -lt 30 ]; then
+            vf="hflip"
+        fi
+
+        echo "  Tile $i: $geom (start at #$start_idx)${vf:+ [flipped]}"
+        play_on_geometry "$playlist" "$geom" "yes" "$opacity" "$start_idx" "$vf"
+
+        # Small delay so each mpv gets a different lua random seed
+        sleep 0.2
+    done
+}
+
+run_collage_loop() {
+    local input="$1"
+    local opacity="$2"
+    local screen_w="$3"
+    local screen_h="$4"
+
+    echo $$ > "$COLLAGE_CONTROLLER_PID"
+
+    trap 'kill_tiles; rm -f "$COLLAGE_CONTROLLER_PID"; pkill -9 -f "audio-pulse.py" 2>/dev/null; echo ""; echo "float stopped."; exit 0' SIGTERM SIGINT
+
+    # Weighted transition intervals — avoid repeating the same one
+    local intervals=(25 35 45 60 75)
+    local last_interval=0
+
+    while true; do
+        kill_tiles
+        sleep 0.5
+
+        # 10% chance of full-screen takeover instead of normal collage
+        if [ $((RANDOM % 100)) -lt 10 ]; then
+            echo "[$(date +%H:%M:%S)] FULL-SCREEN TAKEOVER"
+            local fs_geom="${screen_w}x${screen_h}+0+0"
+            local fs_playlist="${PLAYLIST_BASE}_takeover.m3u"
+            build_playlist "$input" "yes" "$fs_playlist" 2>/dev/null
+            local fs_count=$(wc -l < "$fs_playlist" 2>/dev/null || echo 1)
+            local fs_start=$((RANDOM % fs_count))
+            play_on_geometry "$fs_playlist" "$fs_geom" "yes" "$opacity" "$fs_start"
+            local fs_duration=$((8 + RANDOM % 8))
+            echo "  Takeover for ${fs_duration}s"
+            sleep "$fs_duration" &
+            wait $!
+        else
+            local num_tiles=$((3 + RANDOM % 4))
+            spawn_collage "$input" "$opacity" "$screen_w" "$screen_h" "$num_tiles"
+
+            # Pick interval, re-roll once if same as last
+            local idx=$((RANDOM % ${#intervals[@]}))
+            local wait_time=${intervals[$idx]}
+            if [ "$wait_time" -eq "$last_interval" ]; then
+                idx=$((RANDOM % ${#intervals[@]}))
+                wait_time=${intervals[$idx]}
+            fi
+            last_interval=$wait_time
+
+            echo "  Next reshuffle in ${wait_time}s"
+            sleep "$wait_time" &
+            wait $!
+        fi
+    done
+}
+
+# === PLAYER MODE ===
+# Normal movable/resizable window — no xwinwrap, full user interaction
+# Can be dragged across monitors, maximized to span all displays
+
+play_player() {
+    local playlist="$1"
+    local use_effects="$2"
+    local shuffle="$3"
+
+    TILE_COUNTER=$((TILE_COUNTER + 1))
+    local sock="/tmp/mpv-float-${TILE_COUNTER}.sock"
+
+    local effect_flags=""
+    if [ "$use_effects" = "yes" ]; then
+        effect_flags="--script=\"$DREAM_SCRIPT\" --glsl-shader=\"$ROUNDED_SHADER\""
+    fi
+
+    local shuffle_flag=""
+    if [ "$shuffle" = "yes" ]; then
+        shuffle_flag="--shuffle"
+    fi
+
+    eval mpv \
+        --title="float-player" \
+        --loop-playlist \
+        --no-osc=no \
+        --osc=yes \
+        --osd-bar \
+        --input-ipc-server="$sock" \
+        --hwdec=auto \
+        --panscan=0 \
+        --autofit=50% \
+        --geometry=50%:50% \
+        --keepaspect-window=no \
+        --no-border \
+        $shuffle_flag \
+        $effect_flags \
+        --playlist="$playlist" &
+
+    echo $! >> "$PIDFILE"
+}
+
+send_to_all() {
+    local cmd="$1"
+    local count=0
+    for sock in /tmp/mpv-float-*.sock; do
+        [ -S "$sock" ] || continue
+        echo "$cmd" | socat - "$sock" 2>/dev/null &
+        count=$((count + 1))
+    done
+    wait
+    echo "Sent to $count instances."
+}
+
+# ========== MAIN ==========
+
+if [ "$1" = "--control" ]; then
+    /usr/bin/python3 "$FLOAT_DIR/scripts/float-control.py" &
+    echo "Float control panel launched."
+    exit 0
+fi
+
+if [ "$1" = "--stop" ]; then
+    stop_all
+    exit 0
+fi
+
+if [ "$1" = "--next" ]; then
+    send_to_all '{"command":["playlist-next"]}'
+    exit 0
+fi
+
+if [ "$1" = "--prev" ]; then
+    send_to_all '{"command":["playlist-prev"]}'
+    exit 0
+fi
+
+if [ "$1" = "--list" ]; then
+    list_running
+    exit 0
+fi
+
+if [ -z "$1" ]; then
+    echo "float — Desktop Video Blender"
+    echo ""
+    echo "Usage: float <video_or_folder> [options]"
+    echo ""
+    echo "Options:"
+    echo "  --player           Single movable/resizable window (drag across monitors)"
+    echo "  --effects          Enable dream effects in player mode"
+    echo "  --collage          Random multi-tile collage that reshuffles"
+    echo "  --shuffle          Shuffle playlist order (default: on)"
+    echo "  --all              Play on all monitors"
+    echo "  --monitor N        Play on specific monitor"
+    echo "  --opacity N        Opacity 0.0-1.0 (default 0.04)"
+    echo "  --luts /path       Folder of .cube/.3dl LUT files to rotate"
+    echo "  --lut-interval N   Seconds between LUT changes (default 20)"
+    echo "  --next             Skip to next video (all tiles)"
+    echo "  --prev             Skip to previous video (all tiles)"
+    echo "  --stop             Kill all float instances"
+    echo "  --list             Show running instances"
+    exit 0
+fi
+
+# === SETTINGS ===
+
+read_settings() {
+    if [ ! -f "$SETTINGS_FILE" ]; then return; fi
+    while IFS='=' read -r key value; do
+        # Skip comments and blank lines
+        [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
+        key=$(echo "$key" | xargs)
+        value=$(echo "$value" | xargs)
+        case "$key" in
+            opacity) [[ "$value" =~ ^[0-9]*\.?[0-9]+$ ]] && OPACITY="$value" ;;
+            lut_dir) [ -d "$value" ] && LUT_DIR="$value" ;;
+            lut_interval) [[ "$value" =~ ^[0-9]+$ ]] && LUT_INTERVAL="$value" ;;
+            panscan) [[ "$value" =~ ^[0-9]*\.?[0-9]+$ ]] && PANSCAN="$value" ;;
+        esac
+    done < "$SETTINGS_FILE"
+}
+
+scan_luts() {
+    local lut_dir="$1"
+    if [ -z "$lut_dir" ] || [ ! -d "$lut_dir" ]; then
+        rm -f "$LUT_LIST_FILE" "$LUT_INTERVAL_FILE"
+        return
+    fi
+
+    find "$lut_dir" -type f \( -iname "*.cube" -o -iname "*.3dl" -o -iname "*.png" \) 2>/dev/null > "$LUT_LIST_FILE"
+
+    local count=$(wc -l < "$LUT_LIST_FILE")
+    if [ "$count" -eq 0 ]; then
+        echo "No LUT files found in: $lut_dir"
+        rm -f "$LUT_LIST_FILE"
+        return
+    fi
+
+    echo "$LUT_INTERVAL" > "$LUT_INTERVAL_FILE"
+    echo "Found $count LUTs in: $lut_dir (rotating every ${LUT_INTERVAL}s)"
+}
+
+# Load settings defaults
+LUT_DIR=""
+LUT_INTERVAL="20"
+PANSCAN="0.5"
+read_settings
+
+# Resolve input path
+INPUT="$1"
+if [ ! -f "$INPUT" ] && [ ! -d "$INPUT" ]; then
+    echo "Not found: $1"
+    exit 1
+fi
+
+shift
+
+# Parse flags
+MODE="all"
+MON_NUM=1
+SHUFFLE="yes"
+OPACITY="0.04"
+COLLAGE="no"
+PLAYER="no"
+EFFECTS="no"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --all) MODE="all"; shift ;;
+        --monitor) MODE="single"; MON_NUM="$2"; shift 2 ;;
+        --shuffle) SHUFFLE="yes"; shift ;;
+        --opacity) OPACITY="$2"; shift 2 ;;
+        --collage) COLLAGE="yes"; SHUFFLE="yes"; shift ;;
+        --player) PLAYER="yes"; shift ;;
+        --effects) EFFECTS="yes"; shift ;;
+        --vignette) VIGNETTE="yes"; shift ;;
+        --luts) LUT_DIR="$2"; shift 2 ;;
+        --lut-interval) LUT_INTERVAL="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+
+# Swap shader if vignette mode
+if [ "$VIGNETTE" = "yes" ]; then
+    ROUNDED_SHADER="$VIGNETTE_SHADER"
+fi
+
+# Kill existing instances
+stop_all 2>/dev/null
+
+# Count videos
+if [ -d "$INPUT" ]; then
+    VCOUNT=$(find_videos "$INPUT" | wc -l)
+    echo "Found $VCOUNT videos in: $INPUT"
+fi
+
+# Start audio pulse daemon for music-reactive effects
+if [ -f "$FLOAT_DIR/scripts/audio-pulse.py" ]; then
+    python3 "$FLOAT_DIR/scripts/audio-pulse.py" &>/dev/null &
+    echo $! > "$AUDIO_PULSE_PID"
+    echo "Audio-reactive mode enabled."
+fi
+
+# Scan and write LUT list for the lua script
+scan_luts "$LUT_DIR"
+
+if [ "$PLAYER" = "yes" ]; then
+    echo "=== FLOAT PLAYER MODE ==="
+    MAIN_PLAYLIST="${PLAYLIST_BASE}.m3u"
+    build_playlist "$INPUT" "$SHUFFLE" "$MAIN_PLAYLIST" || exit 1
+
+    local_count=$(wc -l < "$MAIN_PLAYLIST" 2>/dev/null || echo 1)
+    echo "Playlist: $local_count videos"
+    [ "$EFFECTS" = "yes" ] && echo "Dream effects: ON" || echo "Dream effects: OFF"
+    echo "Window is movable, resizable, and can span all monitors."
+    echo "Use 'float --stop' to stop."
+
+    # Audio pulse for effects mode
+    if [ "$EFFECTS" = "yes" ] && [ -f "$FLOAT_DIR/scripts/audio-pulse.py" ]; then
+        python3 "$FLOAT_DIR/scripts/audio-pulse.py" &>/dev/null &
+        echo $! > "$AUDIO_PULSE_PID"
+        echo "Audio-reactive mode enabled."
+    fi
+
+    scan_luts "$LUT_DIR"
+    play_player "$MAIN_PLAYLIST" "$EFFECTS" "$SHUFFLE"
+    echo "Float player running."
+    exit 0
+fi
+
+if [ "$COLLAGE" = "yes" ]; then
+    echo "=== FLOAT COLLAGE MODE ==="
+
+    # Get total screen dimensions (use primary monitor or full desktop)
+    if [ "$MODE" = "all" ]; then
+        # Full desktop span
+        sw=$(xdpyinfo | grep dimensions | awk '{print $2}' | cut -dx -f1)
+        sh=$(xdpyinfo | grep dimensions | awk '{print $2}' | cut -dx -f2)
+    else
+        geom=$(get_monitor_geometry "$MON_NUM")
+        if [ -z "$geom" ]; then
+            echo "Monitor $MON_NUM not found."
+            exit 1
+        fi
+        sw=$(echo "$geom" | cut -dx -f1)
+        sh=$(echo "$geom" | cut -d+ -f1 | cut -dx -f2)
+    fi
+
+    echo "Screen: ${sw}x${sh}"
+    echo "Float running. Ctrl-C or 'float --stop' to stop."
+
+    trap 'stop_all; echo ""; echo "float stopped."; exit 0' SIGINT SIGTERM
+    run_collage_loop "$INPUT" "$OPACITY" "$sw" "$sh"
+else
+    MAIN_PLAYLIST="${PLAYLIST_BASE}.m3u"
+    build_playlist "$INPUT" "$SHUFFLE" "$MAIN_PLAYLIST" || exit 1
+
+    echo "--- Playlist ($(wc -l < "$MAIN_PLAYLIST") videos) ---"
+
+    if [ "$MODE" = "all" ]; then
+        pcount=$(wc -l < "$MAIN_PLAYLIST" 2>/dev/null || echo 1)
+        mon_idx=0
+        while read line; do
+            geom=$(echo "$line" | grep -oE '[0-9]+x[0-9]+\+[0-9]+\+[0-9]+')
+            if [ -n "$geom" ]; then
+                mon_idx=$((mon_idx + 1))
+                local_start=$((RANDOM % pcount))
+                echo "Starting on monitor $mon_idx: $geom (video #$local_start)"
+                play_on_geometry "$MAIN_PLAYLIST" "$geom" "$SHUFFLE" "$OPACITY" "$local_start"
+            fi
+        done < <(xrandr --current | grep ' connected' | sort -t'+' -k2 -n)
+    else
+        geom=$(get_monitor_geometry "$MON_NUM")
+        if [ -z "$geom" ]; then
+            echo "Monitor $MON_NUM not found."
+            exit 1
+        fi
+        echo "Starting on monitor $MON_NUM: $geom"
+        play_on_geometry "$MAIN_PLAYLIST" "$geom" "$SHUFFLE" "$OPACITY"
+    fi
+
+    echo "Float running. Use 'float --stop' to stop."
+fi
